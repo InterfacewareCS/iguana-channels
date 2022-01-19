@@ -1,0 +1,21 @@
+{
+    "LocalDependencies": [
+        "MakeJiffyAccount.lua",
+        "ShowUsers.lua"
+    ],
+    "LuaDependencies": [
+        "dbs.api",
+        "encrypt.password",
+        "net.http.cache",
+        "salesforce",
+        "store2",
+        "tool.global.find"
+    ],
+    "OtherDependencies": [],
+    "timestamp": "1642619000",
+    "version_info": {
+        "build": 0,
+        "major": 6,
+        "minor": 0
+    }
+}
