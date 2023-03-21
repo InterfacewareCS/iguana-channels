@@ -4,6 +4,7 @@
 
 -- Please consult the above URL for information on getting
 -- the credentials required to authenticate this adapter.
+-- v1.1.0
 
 local store2 = require 'store2'
 
@@ -18,6 +19,7 @@ local Store = store2.connect(iguana.project.guid().."salesforce")
 -- Example objects QueueSobject, Account, Community, Contact, ContentDocument, Document, Product2, Event, Group, Note, Profile, Task, TaskPriority, TaskStatus, User
 -- See https://developer.salesforce.com/docs/atlas.en-us.api.meta/api/sforce_api_objects_list.htm
 local sales_objects = "user,account,contact,opportunity,note,opportunityLineItem,pricebookEntry"
+local api_version = '57.0'
 
 local function GetCache(Key, CacheTimeout)
    if (CacheTimeout == 0) then
@@ -78,8 +80,8 @@ local function queryObjects(S, T)
       T.query = T.query.." LIMIT "..T.limit
    end
    local P ={parameters={q=T.query}, url=S.instance_url..T.path,
-             headers={Authorization="Bearer ".. S.access_token}, cache_time=T.cache_time, live=true}
-  
+      headers={Authorization="Bearer ".. S.access_token}, cache_time=T.cache_time, live=true}
+
    local R=net.http.get(P)
    R = json.parse{data=R}
    if #R > 0 and R[1].errorCode then
@@ -106,7 +108,7 @@ local dbs_grammar = {}
 local function listObjects(S,T,D)
    T = T or {}
    T.query = selectQuery(D)
-   T.path = '/services/data/v52.0/query'
+   T.path = '/services/data/v'..api_version..'/query'
    local R = queryObjects(S,T) 
    local T = dbs_grammar:tables(D.object)
    local Data = T[D.object]
@@ -118,6 +120,10 @@ local function listObjects(S,T,D)
             Row[K] = tostring(V)
          elseif K == 'attributes' then
             -- Do nothing
+         elseif type(V) == 'table' then   
+            -- Compound field types are read-only and not included when patching
+            -- Serializing so we can still read when listing
+            Row[K] = json.serialize{data=V}
          else
             Row[K] = V
          end
@@ -142,7 +148,9 @@ local SalesforceDbsMap={
    percent="double",
    int="integer",
    currency="double",
-   double="double"
+   double="double",
+   address="string",
+   encryptedstring ="string"
 }
 
 local function GenerateDbsGrammar(Defs)
@@ -197,7 +205,7 @@ end
 local function deleteObject(S, T, ObjectName)
    local Live = not iguana.isTest() or T.live
    local Path = S.instance_url..
-       '/services/data/v52.0/sobjects/'..ObjectName..'/'..T.id
+   '/services/data/v'..api_version..'/sobjects/'..ObjectName..'/'..T.id
    local Headers={}
    Headers['Content-Type']='application/json'
    Headers.Authorization ="Bearer ".. S.access_token        
@@ -235,13 +243,12 @@ local function patchObject(S, T, Info)
    local ObjectName = Info.object
    local Live = not iguana.isTest() or T.live
    local Path = S.instance_url..
-       '/services/data/v52.0/sobjects/'..ObjectName..'/'
+   '/services/data/v'..api_version..'/sobjects/'..ObjectName..'/'
    local Method
    local TableSet = T.data
    trace(TableSet)
    local Table = TableSet[ObjectName]
-   
-   -- We could consider iterating through all the objects supplied here
+   -- Only look at the first object supplied - use batch method to update or create multiple objects at the same time
    local Data = T.data[ObjectName][1]
    trace(Path)
    local Headers={}
@@ -255,7 +262,7 @@ local function patchObject(S, T, Info)
       Path = Path..Data.Id
       Id = Data.Id:S()
       Data.Id = nil
-      for i=1, #Data do  
+      for i=1, #Data do
          if not Data[i]:isNull() and Info.fields[Data[i]:nodeName()].updatetable then
             J[Data[i]:nodeName()] = Data[i]
          end
@@ -295,12 +302,77 @@ local function GenerateModifierMethod(Name, Info)
    help.set{input_function=F, help_data=Help}      
 end
 
+local function patchObjects(S, T, Info)
+   local ObjectName = Info.object
+   local Live = not iguana.isTest() or T.live
+   local Headers={}
+   Headers['Content-Type']='application/json'
+   Headers.Authorization ="Bearer ".. S.access_token
+   local batchUrl = S.instance_url..
+   '/services/data/v'..api_version..'/composite/batch'
+   -- Iterating through all the objects supplied here and build batch request row for each
+   local batchRequests = {}
+   for i=1, #T.data[ObjectName] do 
+      local Path = 'v'..api_version..'/sobjects/'..ObjectName..'/'
+      local Method
+      local Data = T.data[ObjectName][i]
+      local J= {}
+      local Id 
+      if (not Data.Id:isNull()) then
+         trace("Updating");
+         Method = 'PATCH'
+         Path = Path..Data.Id
+         Id = Data.Id:S()
+         Data.Id = nil
+         for i=1, #Data do
+            if not Data[i]:isNull() and Info.fields[Data[i]:nodeName()].updatetable then
+               J[Data[i]:nodeName()] = Data[i]
+            end
+         end
+      else  
+         trace("New record");
+         Method = 'POST'
+         for i=1, #Data do  
+            if not Data[i]:isNull() and 
+               (Info.fields[Data[i]:nodeName()].updatetable or
+                  Info.fields[Data[i]:nodeName()].createable) then
+               J[Data[i]:nodeName()] = Data[i]
+            end
+         end
+      end
+      table.insert(batchRequests, {
+            ['method'] = Method,
+            ['url'] = Path,
+            ['richInput'] = J
+         })
+   end
+   local req = {}
+   req.batchRequests = batchRequests
+   local batchRequstBody = json.serialize{data=req}
+   local Returned = net.http.put{data=batchRequstBody, method='POST',headers=Headers,
+      url=batchUrl,live=T.live}
+   return ParseResult(Returned)
+end
+
+local function GenerateBatchModifierMethod(Name, Info)
+   local FName = Name..'BatchModify'
+   salesmethods[FName] = function (S,T) return patchObjects(S, T, Info) end
+   local F = salesmethods[FName]
+   local Help = {}
+   Help.Desc = "Create or update a batch of up to 25 "..Name.." objects"
+   Help.ParameterTable = true
+   Help.Parameters = {}
+   Help.Parameters[1] = {data={Desc="Records generated from "..Name.."New."}}
+   Help.Parameters[2] = {live={Opt=true, Desc="If live is true the action will be performed in the editor"}}
+   help.set{input_function=F, help_data=Help}      
+end
+
 local function ObjectName(Name)
    return Name:sub(1,1):lower()..Name:sub(2)
 end
 
 local function DescribeApi(S, Object)
-   local Url = S.instance_url..'/services/data/v52.0/sobjects/'..Object..'/describe/'
+   local Url = S.instance_url..'/services/data/v'..api_version..'/sobjects/'..Object..'/describe/'
    trace(Url)
    local Headers={}
    Headers['Content-Type']='application/json'
@@ -391,6 +463,7 @@ local function BuildMethods(Defs)
    for K,V in pairs(Defs.objects) do
       GenerateListMethod(K,V)
       GenerateModifierMethod(K,V)
+      GenerateBatchModifierMethod(K,V)
       GenerateDeleteMethod(K,V)
       GenerateNewMethod(K,V)
    end
@@ -400,12 +473,12 @@ end
 local function SalesforceConnect(T)
    CheckClearCache(T.clear_cache)
    local P = GetCache(T.consumer_key, 1800) or
-             GetAccessTokenViaHTTP(T.consumer_key, T)
-   
+   GetAccessTokenViaHTTP(T.consumer_key, T)
+
    if T.objects then
       sales_objects = T.objects
    end
-   
+
    setmetatable(P, MetaTable)
    if not BuiltMethods then
       local Def = ObjectDefinitions(P,T.reloadSchema)
@@ -421,33 +494,33 @@ end
 local helpinfo = {}
 
 local HelpConnect = [[{"SeeAlso":[{"Title":"Salesforce.com Adapter","Link":"http://help.interfaceware.com/v6/salesforce-com-adapter"},
-                                  {"Title":"The Salesforce website","Link":"http://www.salesforce.com"}],
-                "Returns":[{"Desc":"The salesforce.com website <u>string</u>."}],
-                "Title":"SalesforceConnect",
-         "Parameters":[{"username":{"Desc":"User ID to login with <u>string</u>."}},
-                       {"password":{"Desc":"Password of that user ID  <u>string</u>."}},
-                       {"consumer_key":{"Desc":"Consumer key for this connected app  <u>string</u>."}},
-                       {"consumer_secret":{"Desc":"Consumer secret for this connected app  <u>string</u>."}},
-                       {"clear_cache":{"Opt" : true,"Desc":"If this is set to true then then the SQLite cache used to improve performace will be cleared  <u>boolean</u>."}},
-                       {"objects": {"Opt" : true, "Desc" : "Optional list of objects to expose in the adapter <u>table</u>."} }],
-         "ParameterTable": true,
-         "Examples":["-- Connect using hard coded parameters - not recommended
+{"Title":"The Salesforce website","Link":"http://www.salesforce.com"}],
+"Returns":[{"Desc":"The salesforce.com website <u>string</u>."}],
+"Title":"SalesforceConnect",
+"Parameters":[{"username":{"Desc":"User ID to login with <u>string</u>."}},
+{"password":{"Desc":"Password of that user ID  <u>string</u>."}},
+{"consumer_key":{"Desc":"Consumer key for this connected app  <u>string</u>."}},
+{"consumer_secret":{"Desc":"Consumer secret for this connected app  <u>string</u>."}},
+{"clear_cache":{"Opt" : true,"Desc":"If this is set to true then then the SQLite cache used to improve performace will be cleared  <u>boolean</u>."}},
+{"objects": {"Opt" : true, "Desc" : "Optional list of objects to expose in the adapter <u>table</u>."} }],
+"ParameterTable": true,
+"Examples":["-- Connect using hard coded parameters - not recommended
 local C = SalesforceConnect{clear_cache=false,
-   username='sales@interfaceware.com', 
-   password='mypassword', 
-   consumer_secret='585519048400883388', 
-   consumer_key='3MVG9KI2HHAq33RyfdfRmZyEybpy7b_bZtwCyJW7e._mxrVtsrbM.g5n3.fIwK3vPGRl2Ly2u7joju3yYpPeO' }",
+username='sales@interfaceware.com', 
+password='mypassword', 
+consumer_secret='585519048400883388', 
+consumer_key='3MVG9KI2HHAq33RyfdfRmZyEybpy7b_bZtwCyJW7e._mxrVtsrbM.g5n3.fIwK3vPGRl2Ly2u7joju3yYpPeO' }",
 "-- Connect using stored ecrypted parameters - recommended
-   local ConsumerKey    = config.load{config='salesforce_consumer_key'   , key=StoreKey}
-   local Password       = config.load{config='salesforce_password'       , key=StoreKey}
-   local ConsumerSecret = config.load{config='salesforce_consumer_secret', key=StoreKey}
-   local UserName       = config.load{config='salesforce_username'       , key=StoreKey}
-      
-   local C = SalesforceConnect{username=UserName, objects=SalesObjects,
-      password=Password, consumer_key=ConsumerKey,  consumer_secret=ConsumerSecret}"],
-         "Usage":"SalesforceConnect{username=&lt;value&gt;, password=&lt;value&gt;, consumer_key=&lt;value&gt;,
-                  consumer_secret=&lt;value&gt; [, clear_cache=&lt;value&gt;] [, objects=&lt;value&gt;]}",
-         "Desc":"Returns a connection object to a specified salesforce instance"}]]
+local ConsumerKey    = config.load{config='salesforce_consumer_key'   , key=StoreKey}
+local Password       = config.load{config='salesforce_password'       , key=StoreKey}
+local ConsumerSecret = config.load{config='salesforce_consumer_secret', key=StoreKey}
+local UserName       = config.load{config='salesforce_username'       , key=StoreKey}
+
+local C = SalesforceConnect{username=UserName, objects=SalesObjects,
+password=Password, consumer_key=ConsumerKey,  consumer_secret=ConsumerSecret}"],
+"Usage":"SalesforceConnect{username=&lt;value&gt;, password=&lt;value&gt;, consumer_key=&lt;value&gt;,
+consumer_secret=&lt;value&gt; [, clear_cache=&lt;value&gt;] [, objects=&lt;value&gt;]}",
+"Desc":"Returns a connection object to a specified salesforce instance"}]]
 
 help.set{input_function=SalesforceConnect, help_data=json.parse{data=HelpConnect}}
 
